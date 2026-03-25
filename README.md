@@ -18,7 +18,6 @@ https://aur.archlinux.org/packages/iwlwifi-lar-patched
 - Allow manual regulatory domain control
 - Based on latest Arch Linux kernel
 - Built as external modules
-- Compatible with Secure Boot (with signing script)
 
 ---
 
