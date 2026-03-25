@@ -1,7 +1,7 @@
 pkgbase = iwlwifi-lar-patched
 	pkgdesc = Patched Intel iwlwifi family modules with lar_disable support for Arch Linux kernels
 	pkgver = 6.19.9
-	pkgrel = 2
+	pkgrel = 3
 	url = https://github.com/TenkyuChimata/iwlwifi-lar-patched
 	install = iwlwifi-lar-patched.install
 	arch = x86_64
