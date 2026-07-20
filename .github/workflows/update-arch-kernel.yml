@@ -1,0 +1,216 @@
+name: Update Arch Linux kernel package
+
+on:
+  schedule:
+    # 每小时第 37 分钟检查，避开整点高峰
+    - cron: "37 * * * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-arch-kernel
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Check, build and publish
+    runs-on: ubuntu-latest
+
+    container:
+      image: archlinux:base-devel
+
+    env:
+      AUR_PACKAGE_NAME: iwlwifi-lar-patched
+      AUR_GIT_NAME: TenkyuChimata
+      AUR_GIT_EMAIL: tenkyuchimata@users.noreply.github.com
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install update tools
+        run: |
+          pacman -Syu --noconfirm --needed \
+            curl \
+            git \
+            jq \
+            openssh \
+            pacman-contrib \
+            rsync
+
+      - name: Check latest Arch kernel
+        id: update
+        run: |
+          chmod +x scripts/update-arch-kernel.sh
+          scripts/update-arch-kernel.sh
+
+      - name: Install kernel build dependencies
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          pacman -S --noconfirm --needed \
+            bc \
+            kmod \
+            linux \
+            linux-headers \
+            namcap \
+            patch
+
+          installed_kernel="$(pacman -Q linux | awk '{print $2}')"
+          expected_kernel="${{ steps.update.outputs.kernelpkgver }}"
+
+          echo "Installed kernel package: ${installed_kernel}"
+          echo "Expected kernel package:  ${expected_kernel}"
+
+          if [[ "${installed_kernel}" != "${expected_kernel}" ]]; then
+            echo "::error::Arch mirror is not synchronized with archlinux.org"
+            exit 1
+          fi
+
+      - name: Create unprivileged build user
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          useradd --create-home builder
+          chown -R builder:builder "${GITHUB_WORKSPACE}"
+
+      - name: Update checksums
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          runuser -u builder -- \
+            bash -lc "
+              cd '${GITHUB_WORKSPACE}'
+              updpkgsums
+            "
+
+      - name: Build package
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          runuser -u builder -- \
+            bash -lc "
+              cd '${GITHUB_WORKSPACE}'
+              makepkg \
+                --cleanbuild \
+                --clean \
+                --noconfirm
+            "
+
+      - name: Regenerate .SRCINFO
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          runuser -u builder -- \
+            bash -lc "
+              cd '${GITHUB_WORKSPACE}'
+              makepkg --printsrcinfo > .SRCINFO
+            "
+
+      - name: Run packaging checks
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+          git diff --check
+
+          namcap PKGBUILD || true
+
+          package_file="$(
+            find "${GITHUB_WORKSPACE}" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.pkg.tar.*' \
+              -print \
+              -quit
+          )"
+
+          if [[ -n "${package_file}" ]]; then
+            namcap "${package_file}" || true
+          fi
+
+      - name: Commit and push GitHub update
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add PKGBUILD .SRCINFO
+
+          if git diff --cached --quiet; then
+            echo "No GitHub changes to commit."
+            exit 0
+          fi
+
+          git commit \
+            -m "Update to linux ${{ steps.update.outputs.kernelpkgver }}"
+
+          git push origin HEAD:${GITHUB_REF_NAME}
+
+      - name: Configure AUR SSH authentication
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          install -d -m 700 "${HOME}/.ssh"
+
+          printf '%s\n' "${AUR_SSH_PRIVATE_KEY}" \
+            > "${HOME}/.ssh/id_ed25519"
+
+          chmod 600 "${HOME}/.ssh/id_ed25519"
+
+          ssh-keyscan -H aur.archlinux.org \
+            >> "${HOME}/.ssh/known_hosts"
+
+          chmod 600 "${HOME}/.ssh/known_hosts"
+
+      - name: Synchronize AUR repository
+        run: |
+          rm -rf /tmp/aur-package
+
+          git clone \
+            "ssh://aur@aur.archlinux.org/${AUR_PACKAGE_NAME}.git" \
+            /tmp/aur-package
+
+          files=(
+            PKGBUILD
+            .SRCINFO
+            0001-iwlwifi-add-lar_disable.patch
+            iwlwifi-lar.conf
+            dracut-iwlwifi.conf
+            iwlwifi-lar-patched.install
+          )
+
+          for file in "${files[@]}"; do
+            install -m 644 \
+              "${GITHUB_WORKSPACE}/${file}" \
+              "/tmp/aur-package/${file}"
+          done
+
+          if [[ -f "${GITHUB_WORKSPACE}/LICENSE" ]]; then
+            install -m 644 \
+              "${GITHUB_WORKSPACE}/LICENSE" \
+              /tmp/aur-package/LICENSE
+          fi
+
+          cd /tmp/aur-package
+
+          git config user.name "${AUR_GIT_NAME}"
+          git config user.email "${AUR_GIT_EMAIL}"
+
+          git add --all
+
+          if git diff --cached --quiet; then
+            echo "AUR repository is already synchronized."
+            exit 0
+          fi
+
+          kernel_version="$(
+            sed -nE \
+              's/^_kernelpkgver="?([^"]+)"?$/\1/p' \
+              PKGBUILD
+          )"
+
+          git commit -m "Update to linux ${kernel_version}"
+          git push origin master
