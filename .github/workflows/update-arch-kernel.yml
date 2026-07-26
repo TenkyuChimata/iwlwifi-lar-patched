@@ -143,16 +143,28 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          readonly repo_dir="${GITHUB_WORKSPACE}"
 
-          git diff --check
+          git config --global --add safe.directory "${repo_dir}"
+
+          if ! git -C "${repo_dir}" \
+            rev-parse --is-inside-work-tree \
+            >/dev/null 2>&1; then
+            echo "::error::Git repository not found at ${repo_dir}"
+            echo "Current directory: $(pwd)"
+            echo "Workspace contents:"
+            ls -la "${repo_dir}" || true
+            exit 1
+          fi
+
+          git -C "${repo_dir}" diff --check
 
           # namcap 的部分警告不一定适用于外部内核模块，
           # 因此暂时仅报告，不阻止发布。
-          namcap PKGBUILD || true
+          namcap "${repo_dir}/PKGBUILD" || true
 
           package_file="$(
-            find "${GITHUB_WORKSPACE}" \
+            find "${repo_dir}" \
               -maxdepth 1 \
               -type f \
               -name '*.pkg.tar.*' \
@@ -173,21 +185,26 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          readonly repo_dir="${GITHUB_WORKSPACE}"
 
-          git config user.name "github-actions[bot]"
-          git config user.email \
+          git config --global --add safe.directory "${repo_dir}"
+
+          git -C "${repo_dir}" config \
+            user.name "github-actions[bot]"
+
+          git -C "${repo_dir}" config \
+            user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add PKGBUILD .SRCINFO
+          git -C "${repo_dir}" add PKGBUILD .SRCINFO
 
-          if git diff --cached --quiet; then
+          if git -C "${repo_dir}" diff --cached --quiet; then
             echo "No GitHub changes to commit."
           else
-            git commit \
+            git -C "${repo_dir}" commit \
               -m "Update to linux ${{ steps.update.outputs.kernelpkgver }}"
 
-            git push \
+            git -C "${repo_dir}" push \
               origin \
               "HEAD:${GITHUB_DEFAULT_BRANCH}"
           fi
