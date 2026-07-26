@@ -23,7 +23,7 @@ jobs:
       image: archlinux:base-devel
 
     # GitHub Actions 在 container 中默认使用 sh；
-    # 本工作流使用了 Bash 数组、[[ ]] 和 pipefail，因此强制使用 bash。
+    # 本工作流使用 Bash 数组、[[ ]] 和 pipefail，因此强制使用 bash。
     defaults:
       run:
         shell: bash
@@ -33,6 +33,7 @@ jobs:
       AUR_GIT_NAME: TenkyuChimata
       AUR_GIT_EMAIL: tenkyuchimata@users.noreply.github.com
       GITHUB_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      PACKAGE_BUILD_DIR: /tmp/iwlwifi-lar-build
 
     steps:
       - name: Check out repository
@@ -42,6 +43,13 @@ jobs:
 
           # 即使手动运行时选择了其他 ref，也始终更新默认分支。
           ref: ${{ github.event.repository.default_branch }}
+
+      - name: Verify checkout
+        run: |
+          set -Eeuo pipefail
+
+          git -C "${GITHUB_WORKSPACE}" rev-parse --show-toplevel
+          git -C "${GITHUB_WORKSPACE}" status --short
 
       - name: Install update tools
         run: |
@@ -60,6 +68,7 @@ jobs:
         run: |
           set -Eeuo pipefail
 
+          cd "${GITHUB_WORKSPACE}"
           chmod +x scripts/update-arch-kernel.sh
           scripts/update-arch-kernel.sh
 
@@ -104,27 +113,14 @@ jobs:
           set -Eeuo pipefail
 
           runuser -u builder -- \
-            bash -lc "
+            env \
+              HOME=/home/builder \
+              GITHUB_WORKSPACE="${GITHUB_WORKSPACE}" \
+            bash -c '
               set -Eeuo pipefail
-              cd '${GITHUB_WORKSPACE}'
+              cd "${GITHUB_WORKSPACE}"
               updpkgsums
-            "
-
-      - name: Build package
-        if: steps.update.outputs.changed == 'true'
-        run: |
-          set -Eeuo pipefail
-
-          runuser -u builder -- \
-            bash -lc "
-              set -Eeuo pipefail
-              cd '${GITHUB_WORKSPACE}'
-
-              makepkg \
-                --cleanbuild \
-                --clean \
-                --noconfirm
-            "
+            '
 
       - name: Regenerate .SRCINFO
         if: steps.update.outputs.changed == 'true'
@@ -132,11 +128,69 @@ jobs:
           set -Eeuo pipefail
 
           runuser -u builder -- \
-            bash -lc "
+            env \
+              HOME=/home/builder \
+              GITHUB_WORKSPACE="${GITHUB_WORKSPACE}" \
+            bash -c '
               set -Eeuo pipefail
-              cd '${GITHUB_WORKSPACE}'
+              cd "${GITHUB_WORKSPACE}"
               makepkg --printsrcinfo > .SRCINFO
-            "
+            '
+
+      - name: Prepare isolated package build directory
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          set -Eeuo pipefail
+
+          readonly repo_dir="${GITHUB_WORKSPACE}"
+          readonly build_dir="${PACKAGE_BUILD_DIR}"
+
+          rm -rf "${build_dir}"
+          install -d -m 755 -o builder -g builder "${build_dir}"
+
+          # makepkg 不在 GitHub 工作树中运行，避免 --clean/--cleanbuild
+          # 或其他构建清理操作影响仓库的 .git 元数据。
+          rsync \
+            --archive \
+            --delete \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='scripts/' \
+            --exclude='src/' \
+            --exclude='pkg/' \
+            --exclude='*.pkg.tar.*' \
+            "${repo_dir}/" \
+            "${build_dir}/"
+
+          chown -R builder:builder "${build_dir}"
+
+          echo "Repository directory: ${repo_dir}"
+          echo "Package build directory: ${build_dir}"
+
+          if ! git -C "${repo_dir}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            echo "::error::Git repository metadata disappeared before package build"
+            ls -la "${repo_dir}" || true
+            exit 1
+          fi
+
+      - name: Build package
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          set -Eeuo pipefail
+
+          runuser -u builder -- \
+            env \
+              HOME=/home/builder \
+              PACKAGE_BUILD_DIR="${PACKAGE_BUILD_DIR}" \
+            bash -c '
+              set -Eeuo pipefail
+              cd "${PACKAGE_BUILD_DIR}"
+
+              makepkg \
+                --cleanbuild \
+                --clean \
+                --noconfirm
+            '
 
       - name: Run packaging checks
         if: steps.update.outputs.changed == 'true'
@@ -144,7 +198,9 @@ jobs:
           set -Eeuo pipefail
 
           readonly repo_dir="${GITHUB_WORKSPACE}"
+          readonly build_dir="${PACKAGE_BUILD_DIR}"
 
+          # 工作区已交给 builder，因此 root 使用 Git 时显式加入安全目录。
           git config --global --add safe.directory "${repo_dir}"
 
           if ! git -C "${repo_dir}" \
@@ -152,28 +208,32 @@ jobs:
             >/dev/null 2>&1; then
             echo "::error::Git repository not found at ${repo_dir}"
             echo "Current directory: $(pwd)"
-            echo "Workspace contents:"
+            echo "Repository contents:"
             ls -la "${repo_dir}" || true
             exit 1
           fi
 
-          git -C "${repo_dir}" diff --check
+          # 仅检查本次自动更新会提交的打包元数据。
+          git -C "${repo_dir}" diff --check -- PKGBUILD .SRCINFO
 
           # namcap 的部分警告不一定适用于外部内核模块，
           # 因此暂时仅报告，不阻止发布。
           namcap "${repo_dir}/PKGBUILD" || true
 
           package_file="$(
-            find "${repo_dir}" \
+            find "${build_dir}" \
               -maxdepth 1 \
               -type f \
               -name '*.pkg.tar.*' \
+              ! -name '*.sig' \
               -print \
               -quit
           )"
 
           if [[ -z "${package_file}" ]]; then
             echo "::error::makepkg completed without producing a package"
+            echo "Build directory contents:"
+            ls -la "${build_dir}" || true
             exit 1
           fi
 
@@ -189,6 +249,14 @@ jobs:
 
           git config --global --add safe.directory "${repo_dir}"
 
+          if ! git -C "${repo_dir}" \
+            rev-parse --is-inside-work-tree \
+            >/dev/null 2>&1; then
+            echo "::error::Git repository not found before commit"
+            ls -la "${repo_dir}" || true
+            exit 1
+          fi
+
           git -C "${repo_dir}" config \
             user.name "github-actions[bot]"
 
@@ -201,6 +269,9 @@ jobs:
           if git -C "${repo_dir}" diff --cached --quiet; then
             echo "No GitHub changes to commit."
           else
+            echo "Changes to commit:"
+            git -C "${repo_dir}" diff --cached --stat
+
             git -C "${repo_dir}" commit \
               -m "Update to linux ${{ steps.update.outputs.kernelpkgver }}"
 
@@ -209,6 +280,9 @@ jobs:
               "HEAD:${GITHUB_DEFAULT_BRANCH}"
           fi
 
+      # 这两个 AUR 步骤故意不加 changed 条件：
+      # 如果上一次运行已经推送 GitHub、但同步 AUR 时临时失败，
+      # 下一次定时运行仍会自动重新同步并恢复一致性。
       - name: Configure AUR SSH authentication
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
