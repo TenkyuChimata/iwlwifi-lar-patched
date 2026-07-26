@@ -36,6 +36,24 @@ jobs:
       PACKAGE_BUILD_DIR: /tmp/iwlwifi-lar-build
 
     steps:
+      # archlinux:base-devel 默认不保证包含 Git。
+      # 必须先安装 Git，再运行 actions/checkout；否则 checkout 可能无法
+      # 创建正常的 Git 工作树，后续也无法使用 git 命令。
+      - name: Install checkout and update tools
+        run: |
+          set -Eeuo pipefail
+
+          pacman -Syu --noconfirm --needed \
+            ca-certificates \
+            curl \
+            git \
+            jq \
+            openssh \
+            pacman-contrib \
+            rsync
+
+          git --version
+
       - name: Check out repository
         uses: actions/checkout@v6
         with:
@@ -48,20 +66,28 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          git -C "${GITHUB_WORKSPACE}" rev-parse --show-toplevel
-          git -C "${GITHUB_WORKSPACE}" status --short
+          readonly repo_dir="${GITHUB_WORKSPACE}"
 
-      - name: Install update tools
-        run: |
-          set -Eeuo pipefail
+          git config --global --add safe.directory "${repo_dir}"
 
-          pacman -Syu --noconfirm --needed \
-            curl \
-            git \
-            jq \
-            openssh \
-            pacman-contrib \
-            rsync
+          if [[ ! -d "${repo_dir}/.git" ]]; then
+            echo "::error::actions/checkout did not create .git metadata"
+            echo "Workspace contents:"
+            ls -la "${repo_dir}" || true
+            exit 1
+          fi
+
+          echo "Git version:"
+          git --version
+
+          echo "Repository root:"
+          git -C "${repo_dir}" rev-parse --show-toplevel
+
+          echo "Checked-out commit:"
+          git -C "${repo_dir}" rev-parse HEAD
+
+          echo "Working-tree status:"
+          git -C "${repo_dir}" status --short
 
       - name: Check latest Arch kernel
         id: update
