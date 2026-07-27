@@ -404,7 +404,7 @@ jobs:
             aur.archlinux.org \
             help
 
-      - name: Synchronize AUR repository
+      - name: Synchronize and verify AUR repository
         run: |
           set -Eeuo pipefail
 
@@ -417,9 +417,50 @@ jobs:
 
           readonly aur_dir="/tmp/aur-package"
           readonly staging_dir="/tmp/aur-package-staging"
+          readonly aur_rpc_url="https://aur.archlinux.org/rpc/v5/info"
+
+          aur_rpc_version() {
+            local response
+
+            if ! response="$(
+              curl \
+                --fail \
+                --silent \
+                --show-error \
+                --location \
+                --retry 5 \
+                --retry-delay 3 \
+                --retry-all-errors \
+                --get \
+                --data-urlencode "arg[]=${AUR_PACKAGE_NAME}" \
+                "${aur_rpc_url}"
+            )"; then
+              echo "::warning::Could not query AUR RPC" >&2
+              printf '%s\n' "<unavailable>"
+              return 0
+            fi
+
+            jq -r \
+              'if (.resultcount // 0) > 0
+               then .results[0].Version
+               else "<missing>"
+               end' \
+              <<< "${response}"
+          }
+
+          srcinfo_value() {
+            local key="$1"
+
+            sed -nE \
+              "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*(.+)$/\1/p" \
+              .SRCINFO \
+              | head -n 1
+          }
 
           rm -rf "${aur_dir}" "${staging_dir}"
 
+          # AUR 与 GitHub 必须保持各自独立的 Git 历史。
+          # 始终先 clone AUR 当前 master，再在它上面创建 fast-forward commit。
           git clone \
             "ssh://aur@aur.archlinux.org/${AUR_PACKAGE_NAME}.git" \
             "${aur_dir}"
@@ -457,7 +498,11 @@ jobs:
               "${staging_dir}/LICENSE"
           fi
 
-          # 让 AUR 工作树精确匹配上面的文件列表，同时保留 .git。
+          # 正常同步时保持 GitHub 生成的 .SRCINFO 原样。
+          # 只有在 AUR Git 已一致、但 aurweb 元数据仍过期时，
+          # 才在后面的恢复分支制造一次无语义的 blob 变化。
+
+          # 让 AUR 工作树精确匹配上面的顶层文件，同时保留 .git。
           rsync \
             --archive \
             --delete \
@@ -470,28 +515,68 @@ jobs:
           git config user.name "${AUR_GIT_NAME}"
           git config user.email "${AUR_GIT_EMAIL}"
 
+          pkgver="$(srcinfo_value pkgver)"
+          pkgrel="$(srcinfo_value pkgrel)"
+          epoch="$(srcinfo_value epoch || true)"
+
+          if [[ -z "${pkgver}" || -z "${pkgrel}" ]]; then
+            echo "::error::Could not read pkgver/pkgrel from .SRCINFO"
+            exit 1
+          fi
+
+          expected_aur_version="${pkgver}-${pkgrel}"
+
+          if [[ -n "${epoch}" ]]; then
+            expected_aur_version="${epoch}:${expected_aur_version}"
+          fi
+
+          current_aur_version="$(aur_rpc_version)"
+
+          echo "Expected AUR version: ${expected_aur_version}"
+          echo "Current AUR RPC version: ${current_aur_version}"
+
           git add --all
 
           if git diff --cached --quiet; then
-            echo "AUR repository is already synchronized."
-            exit 0
-          fi
+            if [[ "${current_aur_version}" == "${expected_aur_version}" ]]; then
+              echo "AUR Git repository and aurweb metadata are already synchronized."
+              exit 0
+            fi
 
-          kernel_version="$(
-            sed -nE \
-              's/^_kernelpkgver="?([^"]+)"?$/\1/p' \
-              PKGBUILD
-          )"
-
-          if [[ -z "${kernel_version}" ]]; then
-            echo "::error::Could not read _kernelpkgver from PKGBUILD"
-            exit 1
+            # 极端恢复路径：文件已经一致，但 aurweb 仍停留在旧版本。
+            # 再增加一个空行，确保本次 push 的 .SRCINFO blob 必然变化。
+            echo "::warning::AUR Git is synchronized, but aurweb metadata is stale"
+            printf '\n' >> .SRCINFO
+            git add .SRCINFO
+            commit_message="Refresh metadata for ${expected_aur_version}"
+          else
+            commit_message="Update to ${expected_aur_version}"
           fi
 
           echo "Files to publish to AUR:"
           git status --short
 
-          git commit \
-            -m "Update to linux ${kernel_version}"
-
+          git commit -m "${commit_message}"
           git push origin master
+
+          # AUR Git push 成功不代表 aurweb 数据库一定已经刷新。
+          # 轮询 RPC，只有网页/API 可见版本正确时才把任务标记为成功。
+          for attempt in $(seq 1 12); do
+            published_aur_version="$(aur_rpc_version)"
+
+            echo \
+              "AUR metadata verification ${attempt}/12: " \
+              "${published_aur_version}"
+
+            if [[ "${published_aur_version}" == "${expected_aur_version}" ]]; then
+              echo "AUR metadata successfully updated."
+              exit 0
+            fi
+
+            sleep 5
+          done
+
+          echo \
+            "::error::AUR Git push succeeded, but aurweb still reports " \
+            "${published_aur_version}; expected ${expected_aur_version}"
+          exit 1
