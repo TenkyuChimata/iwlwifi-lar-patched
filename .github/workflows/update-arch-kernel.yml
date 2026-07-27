@@ -431,6 +431,8 @@ jobs:
                 --retry 5 \
                 --retry-delay 3 \
                 --retry-all-errors \
+                --header 'Cache-Control: no-cache' \
+                --header 'Pragma: no-cache' \
                 --get \
                 --data-urlencode "arg[]=${AUR_PACKAGE_NAME}" \
                 "${aur_rpc_url}"
@@ -561,17 +563,43 @@ jobs:
           git commit -m "${commit_message}"
           git push origin master
 
-          # AUR Git push 成功不代表 aurweb 数据库一定已经刷新。
-          # 轮询 RPC，只有网页/API 可见版本正确时才把任务标记为成功。
-          for attempt in $(seq 1 12); do
+          # 以 AUR Git 远端 HEAD 为发布成功的权威判断。
+          # aurweb/RPC 元数据可能在 Git push 后延迟更新，因此不能用短暂的
+          # RPC 旧值反向否定已经成功的 Git 发布。
+          local_head="$(git rev-parse HEAD)"
+          remote_head="$(
+            git ls-remote origin refs/heads/master \
+              | awk 'NR == 1 { print $1 }'
+          )"
+
+          if [[ -z "${remote_head}" ]]; then
+            echo "::error::Could not read AUR Git remote HEAD"
+            exit 1
+          fi
+
+          echo "Local AUR commit:  ${local_head}"
+          echo "Remote AUR commit: ${remote_head}"
+
+          if [[ "${local_head}" != "${remote_head}" ]]; then
+            echo "::error::AUR Git remote HEAD does not match the pushed commit"
+            exit 1
+          fi
+
+          echo "AUR Git repository successfully updated."
+
+          # 尽量等待 aurweb/RPC 同步，并要求中间缓存重新验证响应。
+          # 即使最终仍未刷新，也只给出 warning；下一次定时运行
+          # 会再次检查并在确有必要时触发元数据恢复。
+          for attempt in $(seq 1 60); do
             published_aur_version="$(aur_rpc_version)"
 
-            echo \
-              "AUR metadata verification ${attempt}/12: " \
+            printf \
+              'AUR metadata verification %d/60: %s\n' \
+              "${attempt}" \
               "${published_aur_version}"
 
             if [[ "${published_aur_version}" == "${expected_aur_version}" ]]; then
-              echo "AUR metadata successfully updated."
+              echo "AUR Git and aurweb metadata successfully updated."
               exit 0
             fi
 
@@ -579,6 +607,11 @@ jobs:
           done
 
           echo \
-            "::error::AUR Git push succeeded, but aurweb still reports " \
+            "::warning::AUR Git was updated successfully, but aurweb RPC still reports " \
             "${published_aur_version}; expected ${expected_aur_version}"
-          exit 1
+
+          echo \
+            "::warning::This is likely delayed aurweb metadata propagation. " \
+            "Published AUR commit: ${remote_head}"
+
+          exit 0
