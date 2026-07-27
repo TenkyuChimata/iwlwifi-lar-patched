@@ -505,7 +505,9 @@ jobs:
           # 让 AUR 工作树精确匹配上面的顶层文件，同时保留 .git。
           rsync \
             --archive \
+            --checksum \
             --delete \
+            --itemize-changes \
             --exclude='.git/' \
             "${staging_dir}/" \
             "${aur_dir}/"
